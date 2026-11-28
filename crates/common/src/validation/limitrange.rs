@@ -1,7 +1,10 @@
 //! LimitRange validation — port of upstream Kubernetes
 //! `pkg/apis/core/validation/validation.go::ValidateLimitRange` (release-1.35).
 //!
-//! Scope: limit `type` validity + uniqueness, the Pod-type default/defaultRequest
+//! Scope: limit `type` validity (`validateLimitRangeTypeName`: a qualified name,
+//! standard or fully qualified) + uniqueness, resource-name validity of every
+//! min/max/default/defaultRequest/maxLimitRequestRatio key
+//! (`validateLimitRangeResourceName`), the Pod-type default/defaultRequest
 //! ban, the PVC-type min/max-storage requirement, the per-resource
 //! min ≤ defaultRequest ≤ default ≤ max ordering, `maxLimitRequestRatio` ≥ 1 and
 //! its `ratio ≤ max/min` ceiling, plus the non-overcommittable-resource
@@ -13,7 +16,9 @@ use std::collections::{HashMap, HashSet};
 use crate::quantity::Quantity;
 use crate::resources::policy::{LimitRange, LimitRangeItem};
 use crate::validation::field::{Error, ErrorList, Path};
+use crate::validation::metav1::is_qualified_name;
 use crate::validation::objectmeta::{name_is_dns_subdomain, validate_object_meta};
+use crate::validation::runtimeclass::{validate_container_resource_name, validate_resource_name};
 
 /// Parse a `name -> quantity-string` map into `name -> (raw, Quantity)`,
 /// skipping entries whose quantity doesn't parse (those are rejected at
@@ -51,17 +56,20 @@ pub fn is_overcommit_allowed(name: &str) -> bool {
 fn validate_item(item: &LimitRangeItem, fld_path: &Path) -> ErrorList {
     let mut errs: ErrorList = Vec::new();
 
-    // type must be one of the known limit types.
-    if !matches!(
-        item.item_type.as_str(),
-        "Pod" | "Container" | "PersistentVolumeClaim"
-    ) {
-        errs.push(Error::not_supported(
-            &fld_path.child("type"),
-            item.item_type.clone(),
-            &["Pod", "Container", "PersistentVolumeClaim"],
-        ));
-    }
+    // `validateLimitRangeResourceName` over each map's keys, in upstream's
+    // order: max, min, then (non-Pod) default and defaultRequest, then
+    // maxLimitRequestRatio below.
+    let name_errs = |errs: &mut ErrorList, m: &Option<HashMap<String, String>>, field: &str| {
+        for k in m.iter().flat_map(|m| m.keys()) {
+            errs.extend(validate_limit_range_resource_name(
+                &item.item_type,
+                k,
+                &fld_path.child(field).key(k),
+            ));
+        }
+    };
+    name_errs(&mut errs, &item.max, "max");
+    name_errs(&mut errs, &item.min, "min");
 
     let min = parse_quantities(&item.min);
     let max = parse_quantities(&item.max);
@@ -80,6 +88,9 @@ fn validate_item(item: &LimitRangeItem, fld_path: &Path) -> ErrorList {
                 "may not be specified when `type` is 'Pod'",
             ));
         }
+    } else {
+        name_errs(&mut errs, &item.default, "default");
+        name_errs(&mut errs, &item.default_request, "defaultRequest");
     }
 
     // PVC limits require at least one of min/max storage.
@@ -92,6 +103,12 @@ fn validate_item(item: &LimitRangeItem, fld_path: &Path) -> ErrorList {
             "either minimum or maximum storage value is required, but neither was provided",
         ));
     }
+
+    name_errs(
+        &mut errs,
+        &item.max_limit_request_ratio,
+        "maxLimitRequestRatio",
+    );
 
     let defaults = parse_quantities(&item.default);
     let default_requests = parse_quantities(&item.default_request);
@@ -236,6 +253,41 @@ fn validate_item(item: &LimitRangeItem, fld_path: &Path) -> ErrorList {
     errs
 }
 
+/// `IsStandardLimitRangeType` (pkg/apis/core/helper/helpers.go:217).
+fn is_standard_limit_range_type(value: &str) -> bool {
+    matches!(value, "Pod" | "Container" | "PersistentVolumeClaim")
+}
+
+/// `validateLimitRangeTypeName` (validation.go:7484): a qualified name that,
+/// when unprefixed, is a standard limit type.
+fn validate_limit_range_type_name(value: &str, fld_path: &Path) -> ErrorList {
+    let mut errs: ErrorList = is_qualified_name(value)
+        .into_iter()
+        .map(|msg| Error::invalid(fld_path, value.to_string(), msg))
+        .collect();
+    if !errs.is_empty() {
+        return errs;
+    }
+    if !value.contains('/') && !is_standard_limit_range_type(value) {
+        errs.push(Error::invalid(
+            fld_path,
+            value.to_string(),
+            "must be a standard limit type or fully qualified",
+        ));
+    }
+    errs
+}
+
+/// `validateLimitRangeResourceName` (validation.go:7504): Pod and Container
+/// limits take container resource names; other types may carry storage and
+/// any `validateResourceName`-valid name.
+fn validate_limit_range_resource_name(limit_type: &str, value: &str, fld_path: &Path) -> ErrorList {
+    match limit_type {
+        "Pod" | "Container" => validate_container_resource_name(value, fld_path),
+        _ => validate_resource_name(value, fld_path),
+    }
+}
+
 /// Upstream `ValidateLimitRange` (`pkg/apis/core/validation/validation.go:7514`).
 /// `ValidateLimitRangeName` is `NameIsDNSSubdomain`. The registry uses it for
 /// both create and update (`pkg/registry/core/limitrange/strategy.go`).
@@ -250,6 +302,10 @@ pub fn validate_limit_range(lr: &LimitRange) -> ErrorList {
     let mut seen_types: HashSet<&str> = HashSet::new();
     for (i, item) in lr.spec.limits.iter().enumerate() {
         let idx_path = fld_path.index(i);
+        errs.extend(validate_limit_range_type_name(
+            &item.item_type,
+            &idx_path.child("type"),
+        ));
         if !seen_types.insert(item.item_type.as_str()) {
             errs.push(Error::duplicate(
                 &idx_path.child("type"),

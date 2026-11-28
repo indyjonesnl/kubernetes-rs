@@ -62,7 +62,7 @@ mod tests {
     #[test]
     fn limit_range_unknown_type_rejected() {
         let errs = validate_limit_range(&lr(vec![item("Bogus")]));
-        assert!(has_err(&errs, "type", "supported"));
+        assert!(has_err(&errs, "type", "standard limit type"));
     }
 
     #[test]

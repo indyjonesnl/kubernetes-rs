@@ -37,8 +37,9 @@ fn valid_container_limits_pass() {
 #[test]
 fn unknown_type_not_supported() {
     let errs = validate_limit_range(&lr(json!([{"type": "Bogus", "max": {"cpu": "1"}}])));
+    // `validateLimitRangeTypeName`: Invalid, not NotSupported.
     assert!(
-        has(&errs, "spec.limits[0].type", ErrorType::NotSupported),
+        has(&errs, "spec.limits[0].type", ErrorType::Invalid),
         "got: {errs:?}"
     );
 }

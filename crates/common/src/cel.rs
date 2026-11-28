@@ -32,7 +32,11 @@ impl CELEvaluator {
     /// collected; see [`cel_struct`].
     fn compiled(&mut self, expression: &str) -> Result<&CompiledExpression> {
         if !self.program_cache.contains_key(expression) {
-            let prog = cel_struct::compile(expression)
+            // `ObserveCompilation` after `env.Compile` (admission/plugin/cel/compile.go).
+            let started = std::time::Instant::now();
+            let compiled = cel_struct::compile(expression);
+            crate::cel_metrics::observe_compilation(started.elapsed());
+            let prog = compiled
                 .map_err(|e| anyhow!("Failed to compile CEL expression '{}': {}", expression, e))?;
             self.program_cache.insert(expression.to_string(), prog);
         }
@@ -60,7 +64,7 @@ impl CELEvaluator {
         }
 
         // Execute the program
-        let result = cel_struct::execute(program, &cel_context)
+        let result = observed_eval(|| cel_struct::execute(program, &cel_context))
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))?;
 
         // Convert result to boolean
@@ -87,7 +91,7 @@ impl CELEvaluator {
         }
 
         // Execute the program
-        let result = cel_struct::execute(program, &cel_context)
+        let result = observed_eval(|| cel_struct::execute(program, &cel_context))
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))?;
 
         // Convert result to string
@@ -110,7 +114,7 @@ impl CELEvaluator {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
 
-        cel_struct::execute(program, &cel_context)
+        observed_eval(|| cel_struct::execute(program, &cel_context))
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))
     }
 
@@ -126,7 +130,7 @@ impl CELEvaluator {
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
-        cel_struct::execute_raw(program, &cel_context)
+        observed_eval(|| cel_struct::execute_raw(program, &cel_context))
             .map_err(|e| anyhow!("Failed to execute CEL expression '{}': {}", expression, e))
     }
 
@@ -172,7 +176,7 @@ impl CELEvaluator {
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
-        crate::cel_cost::eval_with_cost(program.expression(), &cel_context, opts)
+        observed_eval(|| crate::cel_cost::eval_with_cost(program.expression(), &cel_context, opts))
     }
 
     /// [`Self::evaluate_with_cost`] with `variables` resolved lazily through
@@ -205,12 +209,14 @@ impl CELEvaluator {
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
-        let (r, cost) = crate::cel_cost::eval_with_cost_lazy(
-            program.expression(),
-            &cel_context,
-            opts,
-            Some(lazy),
-        );
+        let (r, cost) = observed_eval(|| {
+            crate::cel_cost::eval_with_cost_lazy(
+                program.expression(),
+                &cel_context,
+                opts,
+                Some(lazy),
+            )
+        });
         (r.map(|v| cel_struct::strip_type_markers(&v)), cost)
     }
 
@@ -228,7 +234,7 @@ impl CELEvaluator {
         for (key, value) in &context.variables {
             let _ = cel_context.add_variable(key.clone(), value.clone());
         }
-        cel_struct::execute_checked(program, &cel_context, mode).map_err(|e| {
+        observed_eval(|| cel_struct::execute_checked(program, &cel_context, mode)).map_err(|e| {
             if e.starts_with("unexpected type name") {
                 anyhow!("type mismatch: {e}")
             } else {
@@ -253,6 +259,15 @@ impl Default for CELEvaluator {
 
 /// A CEL error that comes from a declaration this server does not supply,
 /// rather than from the expression being malformed.
+/// `ObserveEvaluation` around `prog.ContextEval`
+/// (admission/plugin/cel/validator.go, cel/common).
+fn observed_eval<T>(f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let r = f();
+    crate::cel_metrics::observe_evaluation(started.elapsed());
+    r
+}
+
 fn is_missing_declaration(err: &str) -> bool {
     let err = err.to_lowercase();
     err.contains("no such key")

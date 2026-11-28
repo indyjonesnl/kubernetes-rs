@@ -36,3 +36,21 @@ fn cel_metrics_observe_evaluation() {
     assert_eq!(c1 - c0, 1);
     assert!(((s1 - s0) - 2.0).abs() < 1e-7);
 }
+
+/// The call sites record: one compilation per cache miss, one evaluation per run.
+#[test]
+fn cel_metrics_recorded_by_evaluator() {
+    use kubernetes_rs_common::cel::{CELContext, CELEvaluator};
+    observe_compilation(Duration::ZERO);
+    observe_evaluation(Duration::ZERO);
+    let (cc0, _) = gather("apiserver_cel_compilation_duration_seconds");
+    let (ec0, _) = gather("apiserver_cel_evaluation_duration_seconds");
+    let mut ev = CELEvaluator::new();
+    let ctx = CELContext::new();
+    assert!(ev.evaluate("1 == 1", &ctx).unwrap());
+    assert!(ev.evaluate("1 == 1", &ctx).unwrap());
+    let (cc1, _) = gather("apiserver_cel_compilation_duration_seconds");
+    let (ec1, _) = gather("apiserver_cel_evaluation_duration_seconds");
+    assert_eq!(cc1 - cc0, 1);
+    assert_eq!(ec1 - ec0, 2);
+}

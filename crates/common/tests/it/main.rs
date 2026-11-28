@@ -28,6 +28,7 @@ mod fuzz_roundtrip_jsonproto_test;
 mod intorstring_lossy_type_guard;
 mod ipaddress_test;
 mod k8s_openapi_parity;
+mod limitrange_validation;
 mod list_empty_items_invariant_test;
 mod managed_fields_roundtrip_test;
 mod metrics_wire_shape_test;

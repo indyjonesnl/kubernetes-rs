@@ -101,7 +101,7 @@ pub fn validate_resource_name(name: &str, fld_path: &Path) -> ErrorList {
 }
 
 /// Mirrors upstream `validateContainerResourceName`.
-fn validate_container_resource_name(name: &str, fld_path: &Path) -> ErrorList {
+pub(crate) fn validate_container_resource_name(name: &str, fld_path: &Path) -> ErrorList {
     let mut errs = validate_resource_name(name, fld_path);
     if !name.contains('/') {
         if !is_standard_container_resource_name(name) {

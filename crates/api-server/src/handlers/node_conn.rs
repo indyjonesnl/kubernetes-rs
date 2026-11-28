@@ -16,6 +16,23 @@ pub const DEFAULT_PREFERRED_ADDRESS_TYPES: [&str; 5] = [
     "ExternalIP",
 ];
 
+static PREFERRED_ADDRESS_TYPES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// `--kubelet-preferred-address-types` (options.go:129): set once at startup;
+/// an empty list keeps the default, as the flag's default does.
+pub fn set_preferred_address_types(types: Vec<String>) {
+    if !types.is_empty() {
+        let _ = PREFERRED_ADDRESS_TYPES.set(types);
+    }
+}
+
+fn preferred_address_types() -> Vec<&'static str> {
+    match PREFERRED_ADDRESS_TYPES.get() {
+        Some(t) => t.iter().map(String::as_str).collect(),
+        None => DEFAULT_PREFERRED_ADDRESS_TYPES.to_vec(),
+    }
+}
+
 /// `NoMatchError` (`pkg/util/node/node.go:36-44`).
 #[derive(Debug, Clone)]
 pub struct NoMatchError {
@@ -84,17 +101,27 @@ pub struct NodeConn {
 /// 2. `status.daemonEndpoints.kubeletEndpoint.port` — advertised by the kubelet.
 /// 3. 10250 — the Kubernetes default.
 ///
-/// Returns `Err(kubernetes_rs_common::Error::NotFound)` when the node has no
+/// Returns `Err(kubernetes_rs_common::Error::Internal)` (upstream's plain error) when the node has no
 /// usable address.
 pub fn node_conn(
     node: &Node,
     port_override: Option<u16>,
 ) -> Result<NodeConn, kubernetes_rs_common::Error> {
+    node_conn_with_types(node, port_override, &preferred_address_types())
+}
+
+/// [`node_conn`] with an explicit `--kubelet-preferred-address-types`.
+pub fn node_conn_with_types(
+    node: &Node,
+    port_override: Option<u16>,
+    preferred: &[&str],
+) -> Result<NodeConn, kubernetes_rs_common::Error> {
     // `NodeConnectionInfoGetter.GetConnectionInfo`
-    // (`pkg/kubelet/client/kubelet_client.go:195`) with the default
-    // `--kubelet-preferred-address-types`.
-    let host = get_preferred_node_address(node, &DEFAULT_PREFERRED_ADDRESS_TYPES)
-        .map_err(|e| kubernetes_rs_common::Error::NotFound(e.to_string()))?;
+    // (`pkg/kubelet/client/kubelet_client.go:195`) with
+    // `--kubelet-preferred-address-types`. It returns the NoMatchError
+    // unchanged, a plain error the REST layer reports as a 500.
+    let host = get_preferred_node_address(node, preferred)
+        .map_err(|e| kubernetes_rs_common::Error::Internal(e.to_string()))?;
 
     let port = port_override.unwrap_or_else(|| {
         node.status

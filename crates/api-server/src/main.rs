@@ -684,6 +684,10 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("--kubelet-certificate-authority: {e}"))?;
     }
 
+    kubernetes_rs_api_server::handlers::node_conn::set_preferred_address_types(
+        args.upstream.kubelet_preferred_address_types.clone(),
+    );
+
     let mut image_policy_config = None;
     if let Some(path) = &args.admission_control_config_file {
         let yaml = std::fs::read_to_string(path)

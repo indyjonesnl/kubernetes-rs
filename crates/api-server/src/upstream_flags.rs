@@ -70,7 +70,9 @@ pub struct UpstreamCompatArgs {
     #[arg(long)]
     pub kubelet_certificate_authority: Option<String>,
 
-    /// `--kubelet-preferred-address-types` (options.go:129). Accepted, ignored.
+    /// `--kubelet-preferred-address-types` (options.go:129): the order of node
+    /// address types the kubelet connection uses; applied by
+    /// `handlers::node_conn::set_preferred_address_types`.
     #[arg(long, value_delimiter = ',')]
     pub kubelet_preferred_address_types: Vec<String>,
 
@@ -198,10 +200,6 @@ impl UpstreamCompatArgs {
                 "--kubelet-client-certificate",
             ),
             (self.kubelet_client_key.is_some(), "--kubelet-client-key"),
-            (
-                !self.kubelet_preferred_address_types.is_empty(),
-                "--kubelet-preferred-address-types",
-            ),
             (self.etcd_cafile.is_some(), "--etcd-cafile"),
             (self.etcd_certfile.is_some(), "--etcd-certfile"),
             (self.etcd_keyfile.is_some(), "--etcd-keyfile"),

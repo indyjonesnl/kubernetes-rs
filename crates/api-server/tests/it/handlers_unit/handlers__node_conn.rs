@@ -76,20 +76,20 @@ mod tests {
     }
 
     #[test]
-    fn no_address_returns_not_found() {
+    fn no_address_returns_plain_error() {
         let node = make_node(vec![], None);
         let err = node_conn(&node, None).unwrap_err();
         assert!(
-            matches!(err, kubernetes_rs_common::Error::NotFound(_)),
-            "expected NotFound, got: {err:?}"
+            matches!(err, kubernetes_rs_common::Error::Internal(_)),
+            "expected Internal, got: {err:?}"
         );
     }
 
     #[test]
-    fn no_status_returns_not_found() {
+    fn no_status_returns_plain_error() {
         let node = Node::new("bare-node");
         let err = node_conn(&node, None).unwrap_err();
-        assert!(matches!(err, kubernetes_rs_common::Error::NotFound(_)));
+        assert!(matches!(err, kubernetes_rs_common::Error::Internal(_)));
     }
 
     #[test]
@@ -178,5 +178,26 @@ mod tests {
         assert_eq!(node_conn(&node, None).unwrap().host, "x.example");
         let node = make_node(vec![a("InternalDNS", "n.local")], None);
         assert_eq!(node_conn(&node, None).unwrap().host, "n.local");
+    }
+
+    /// `--kubelet-preferred-address-types` reorders the lookup; no match is
+    /// the plain NoMatchError text (`pkg/util/node/node.go:36-44`).
+    #[test]
+    fn preferred_address_flag_order_applies() {
+        let a = |t: &str, v: &str| NodeAddress {
+            address_type: t.to_string(),
+            address: v.to_string(),
+        };
+        let node = make_node(
+            vec![a("InternalIP", "10.0.0.1"), a("ExternalIP", "1.1.1.1")],
+            None,
+        );
+        let c = node_conn_with_types(&node, None, &["ExternalIP", "InternalIP"]).unwrap();
+        assert_eq!(c.host, "1.1.1.1");
+        let err = node_conn_with_types(&node, None, &["Hostname"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Internal error: no preferred addresses found; known addresses: [{InternalIP 10.0.0.1} {ExternalIP 1.1.1.1}]"
+        );
     }
 }

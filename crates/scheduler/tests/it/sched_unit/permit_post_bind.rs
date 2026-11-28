@@ -719,3 +719,37 @@ async fn scheduler_metrics_extension_point_duration() {
         assert_eq!(count(p, s), b + 1, "{p}/{s}");
     }
 }
+
+/// `RunPostFilterPlugins` observes `FrameworkExtensionPointDuration{PostFilter,
+/// status.Code(), profileName}` once per call (framework.go:1080-1083). A pod
+/// that fits nowhere and has no preemption candidate gets Unschedulable
+/// (preemption.go:309-312).
+#[tokio::test]
+async fn scheduler_metrics_post_filter_extension_point_duration() {
+    use kubernetes_rs_scheduler::diagnosis::Diagnosis;
+    use kubernetes_rs_scheduler::metrics as m;
+    let scheduler = Scheduler::new_with_name(
+        Arc::new(MemoryStorage::new()),
+        1,
+        "default-scheduler".to_string(),
+    );
+    let count = || {
+        m::metrics()
+            .framework_extension_point_duration
+            .with_label_values(&[m::POST_FILTER, "Unschedulable", "default-scheduler"])
+            .get_sample_count()
+    };
+    let before = count();
+    let pod = pod_named("p", "p");
+    scheduler
+        .post_filter(
+            &pod,
+            &[],
+            &[],
+            &Default::default(),
+            &[],
+            &Diagnosis::default(),
+        )
+        .await;
+    assert_eq!(count(), before + 1);
+}

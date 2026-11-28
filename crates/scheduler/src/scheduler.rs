@@ -2590,6 +2590,51 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
         pdbs: &[kubernetes_rs_common::resources::PodDisruptionBudget],
         diagnosis: &Diagnosis,
     ) -> PostFilterOutcome {
+        // `RunPostFilterPlugins` (framework.go:1080-1083): the deferred
+        // `FrameworkExtensionPointDuration{PostFilter, status.Code(),
+        // profileName}`. Only called when `HasPostFilterPlugins`
+        // (schedule_one.go:167-170). DefaultPreemption returns Success when
+        // preemption picked a node and Unschedulable otherwise (not eligible,
+        // policy Never, no candidates: default_preemption.go:101-113,
+        // preemption.go:283-312); the framework turns the loop's failure into
+        // Unschedulable (framework.go:1118).
+        let start = std::time::Instant::now();
+        let outcome = self
+            .post_filter_inner(
+                cycle_state,
+                pod,
+                nodes,
+                all_pods,
+                priority_classes,
+                pdbs,
+                diagnosis,
+            )
+            .await;
+        if let Ok(profile) = self.profile_for(pod) {
+            if profile.framework.has_post_filter_plugins() {
+                let code = match outcome {
+                    PostFilterOutcome::Preempt(..) => crate::fwk::Code::Success,
+                    _ => crate::fwk::Code::Unschedulable,
+                };
+                profile
+                    .framework
+                    .observe_extension_point(crate::metrics::POST_FILTER, code, start);
+            }
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn post_filter_inner(
+        &self,
+        cycle_state: Option<&CycleState>,
+        pod: &Pod,
+        nodes: &[Node],
+        all_pods: &[Pod],
+        priority_classes: &HashMap<String, PriorityClass>,
+        pdbs: &[kubernetes_rs_common::resources::PodDisruptionBudget],
+        diagnosis: &Diagnosis,
+    ) -> PostFilterOutcome {
         // `RunPostFilterPlugins` runs only the pod's profile's PostFilter
         // plugins; DefaultPreemption is the one that evicts victims
         // (schedule_one.go:172 `HasPostFilterPlugins`).

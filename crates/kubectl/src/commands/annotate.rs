@@ -1,69 +1,151 @@
+//! `kubectl annotate`.
+//!
+//! Port of `staging/src/k8s.io/kubectl/pkg/cmd/annotate/annotate.go`
+//! (release-1.35): `parseAnnotations` (`cmdutil.ParsePairs`),
+//! `validateAnnotations` (:445), `validateNoAnnotationOverwrites` (:459),
+//! `updateAnnotations` (:477) and the patch step of `RunAnnotate`. The flags
+//! that need the resource builder are backlog kubectl-P2-35b.
+
 use anyhow::{Context, Result};
 use kubernetes_rs_client::http::ApiClient;
-use serde_json::{json, Value};
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::BTreeMap;
 
-/// Update annotations on a resource
+use super::label::{create_merge_patch, object_path, resolve_target, set_string_map, string_map};
+
+/// `polymorphichelpers.ChangeCauseAnnotation` (history.go:45).
+pub const CHANGE_CAUSE_ANNOTATION: &str = "kubernetes.io/change-cause";
+
+/// `cmdutil.ParsePairs(args, "annotation", true)` (helpers.go:778).
+pub fn parse_annotations(
+    args: &[String],
+) -> Result<(BTreeMap<String, String>, Vec<String>), String> {
+    let mut new_pairs = BTreeMap::new();
+    let mut remove = Vec::new();
+    let mut invalid: Vec<&str> = Vec::new();
+    for arg in args {
+        if arg.contains('=') && !arg.starts_with('=') {
+            let (k, v) = arg.split_once('=').unwrap();
+            new_pairs.insert(k.to_string(), v.to_string());
+        } else if arg.ends_with('-') && arg != "-" {
+            remove.push(arg[..arg.len() - 1].to_string());
+        } else {
+            invalid.push(arg);
+        }
+    }
+    if !invalid.is_empty() {
+        return Err(format!("invalid annotation format: {}", invalid.join(", ")));
+    }
+    Ok((new_pairs, remove))
+}
+
+/// `validateAnnotations` (annotate.go:445).
+pub fn validate_annotations(
+    remove: &[String],
+    new_annotations: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let both: Vec<&str> = remove
+        .iter()
+        .filter(|r| new_annotations.contains_key(*r))
+        .map(String::as_str)
+        .collect();
+    if both.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "can not both modify and remove the following annotation(s) in the same command: {}",
+            both.join(", ")
+        ))
+    }
+}
+
+/// `validateNoAnnotationOverwrites` (annotate.go:459).
+pub fn validate_no_annotation_overwrites(
+    obj: &Value,
+    annotations: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let current = string_map(obj, "annotations");
+    let found: Vec<String> = annotations
+        .iter()
+        .filter(|(k, _)| k.as_str() != CHANGE_CAUSE_ANNOTATION)
+        .filter_map(|(k, v)| match current.get(k) {
+            Some(cur) if cur != v => Some(format!("'{k}' already has a value ({cur})")),
+            _ => None,
+        })
+        .collect();
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "--overwrite is false but found the following declared annotation(s): {}",
+            found.join("; ")
+        ))
+    }
+}
+
+/// `AnnotateOptions.updateAnnotations` (annotate.go:477).
+pub fn update_annotations(
+    obj: &mut Value,
+    overwrite: bool,
+    resource_version: &str,
+    new_annotations: &BTreeMap<String, String>,
+    remove: &[String],
+) -> Result<(), String> {
+    if !overwrite {
+        validate_no_annotation_overwrites(obj, new_annotations)?;
+    }
+    let mut annotations = string_map(obj, "annotations");
+    for (k, v) in new_annotations {
+        annotations.insert(k.clone(), v.clone());
+    }
+    for a in remove {
+        annotations.remove(a);
+    }
+    set_string_map(obj, "annotations", annotations);
+    if !resource_version.is_empty() {
+        if let Some(Value::Object(m)) = obj.get_mut("metadata") {
+            m.insert(
+                "resourceVersion".into(),
+                Value::String(resource_version.into()),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Update annotations on a resource (`RunAnnotate`, for one named object).
 pub async fn execute(
     client: &ApiClient,
     resource_type: &str,
     name: &str,
     namespace: &str,
     annotations: &[String],
-    _overwrite: bool,
+    overwrite: bool,
 ) -> Result<()> {
-    // Parse annotations from key=value or key- (removal) format
-    let mut annotation_map = HashMap::new();
-    for annotation in annotations {
-        if let Some(key) = annotation.strip_suffix('-') {
-            // Annotation removal - set to null
-            annotation_map.insert(key.to_string(), Value::Null);
-        } else if let Some((key, value)) = annotation.split_once('=') {
-            annotation_map.insert(key.to_string(), Value::String(value.to_string()));
-        } else {
-            anyhow::bail!(
-                "Invalid annotation format: {}. Expected key=value or key-",
-                annotation
-            );
-        }
+    let (new_annotations, remove) = parse_annotations(annotations).map_err(anyhow::Error::msg)?;
+    // Validate (annotate.go:276): at least one update, no modify+remove clash.
+    if new_annotations.is_empty() && remove.is_empty() {
+        anyhow::bail!("at least one annotation update is required");
     }
+    validate_annotations(&remove, &new_annotations).map_err(anyhow::Error::msg)?;
+    let target = resolve_target(resource_type)?;
+    let path = object_path(&target, namespace, name);
 
-    // Build API path based on resource type
-    let (api_path, resource_name) = match resource_type {
-        "pod" | "pods" => ("api/v1", "pods"),
-        "service" | "services" | "svc" => ("api/v1", "services"),
-        "deployment" | "deployments" | "deploy" => ("apis/apps/v1", "deployments"),
-        "daemonset" | "daemonsets" | "ds" => ("apis/apps/v1", "daemonsets"),
-        "statefulset" | "statefulsets" | "sts" => ("apis/apps/v1", "statefulsets"),
-        "replicaset" | "replicasets" | "rs" => ("apis/apps/v1", "replicasets"),
-        "configmap" | "configmaps" | "cm" => ("api/v1", "configmaps"),
-        "secret" | "secrets" => ("api/v1", "secrets"),
-        "node" | "nodes" => ("api/v1", "nodes"),
-        _ => anyhow::bail!("Unsupported resource type: {}", resource_type),
-    };
+    let mut obj: Value = client
+        .get(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("Failed to get {}/{name}", target.print_name))?;
+    let old = obj.clone();
+    update_annotations(&mut obj, overwrite, "", &new_annotations, &remove)
+        .map_err(anyhow::Error::msg)?;
 
-    let path = if resource_name == "nodes" {
-        format!("/{}/{}/{}", api_path, resource_name, name)
-    } else {
-        format!(
-            "/{}/namespaces/{}/{}/{}",
-            api_path, namespace, resource_name, name
-        )
-    };
-
-    let patch_body = json!({
-        "metadata": {
-            "annotations": annotation_map
-        }
-    });
-
-    // Use merge patch for annotations
-    let result: Value = client
-        .patch(&path, &patch_body, "application/merge-patch+json")
+    let patch = create_merge_patch(&old, &obj);
+    let _: Value = client
+        .patch(&path, &patch, "application/merge-patch+json")
         .await
         .context("Failed to update annotations")?;
 
-    println!("{}", serde_json::to_string_pretty(&result)?);
-
+    println!("{}/{} annotated", target.print_name, name);
     Ok(())
 }

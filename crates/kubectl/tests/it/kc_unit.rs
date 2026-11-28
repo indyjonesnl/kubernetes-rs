@@ -29,6 +29,7 @@ mod commands__help;
 mod commands__kuberc;
 mod commands__kustomize;
 mod commands__label;
+mod commands__label_annotate;
 mod commands__logs;
 mod commands__options;
 mod commands__patch;

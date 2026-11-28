@@ -2718,6 +2718,7 @@ dependencies = [
  "kubernetes-rs-client",
  "kubernetes-rs-common",
  "mimalloc",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

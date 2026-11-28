@@ -195,3 +195,136 @@ mod tests {
         );
     }
 }
+
+/// Ports of `proxy_server_test.go` (`TestAccept`, `TestRegexpMatch`,
+/// `TestExtractHost`) plus the 403 path of `FilterServer.ServeHTTP`.
+mod proxy_filter {
+    use kubernetes_rs_kubectl::commands::proxy::*;
+
+    fn filter(reject_paths: &str, reject_methods: &str) -> FilterServer {
+        FilterServer::new(
+            DEFAULT_PATH_ACCEPT_RE,
+            reject_paths,
+            DEFAULT_HOST_ACCEPT_RE,
+            reject_methods,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn proxy_filter_accept_table() {
+        let d = DEFAULT_PATH_REJECT_RE;
+        let m = DEFAULT_METHOD_REJECT_RE;
+        let pod = "/api/v1/namespaces/default/pods/somepod";
+        let cases: Vec<(&str, &str, &str, &str, &str, bool)> = vec![
+            (d, m, "", "127.0.0.1", "GET", true),
+            (d, m, "/api/v1/pods", "127.0.0.1", "GET", true),
+            (d, m, "/api/v1/pods", "localhost", "GET", true),
+            (
+                d,
+                m,
+                "/api/v1/namespaces/default/pods/attachfoo",
+                "localhost",
+                "GET",
+                true,
+            ),
+            (
+                d,
+                m,
+                "/api/v1/namespaces/default/pods/execfoo",
+                "localhost",
+                "GET",
+                true,
+            ),
+            (
+                d,
+                m,
+                "/api/v1/namespaces/default/pods/foo/exec",
+                "127.0.0.1",
+                "GET",
+                false,
+            ),
+            (
+                d,
+                m,
+                "/api/v1/namespaces/default/pods/foo/attach",
+                "127.0.0.1",
+                "GET",
+                false,
+            ),
+            (d, m, "/api/v1/pods", "evil.com", "GET", false),
+            (d, m, "/api/v1/pods", "localhost.evil.com", "GET", false),
+            (d, m, "/api/v1/pods", "127a0b0c1", "GET", false),
+            (d, m, "/ui", "localhost", "GET", true),
+            (d, m, "/api/v1/pods", "localhost", "POST", true),
+            (d, "POST", "/api/v1/pods", "localhost", "POST", false),
+            (d, "PUT", pod, "localhost", "PUT", false),
+            (d, "PATCH", pod, "localhost", "PATCH", false),
+            (d, "POST,PUT,PATCH", pod, "localhost", "PATCH", false),
+            (d, "POST,PUT,PATCH", pod, "localhost", "PUT", false),
+            (
+                d,
+                m,
+                "/api/v1/namespaces/default/pods/somepod/exec",
+                "localhost",
+                "POST",
+                false,
+            ),
+            (
+                "",
+                m,
+                "/api/v1/namespaces/default/pods/somepod/exec",
+                "localhost",
+                "POST",
+                true,
+            ),
+        ];
+        for (rp, rm, path, host, method, want) in cases {
+            assert_eq!(
+                filter(rp, rm).accept(method, path, host),
+                want,
+                "{rp} {rm} {path} {host} {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_filter_regexp_match() {
+        let t = |s: &str, res: &str| matches_regexp(s, &make_regexp_array(res).unwrap());
+        assert!(t("foo", "bar,.*"));
+        assert!(t("foo", "bar,fo.*"));
+        assert!(t("bar", "bar,fo.*"));
+        assert!(!t("baz", "bar,fo.*"));
+        assert!(make_regexp_array("(").is_err());
+    }
+
+    #[test]
+    fn proxy_filter_extract_host() {
+        assert_eq!(extract_host("localhost:8085"), "localhost");
+        assert_eq!(extract_host("marmalade"), "marmalade");
+        assert_eq!(extract_host("[::1]:8001"), "::1");
+    }
+
+    #[tokio::test]
+    async fn proxy_filter_forbids_rejected_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cfg = ProxyConfig {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            api_server: "http://127.0.0.1:1".to_string(),
+            token: None,
+            skip_tls_verify: false,
+        };
+        let l = bind_listener(&cfg).await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(serve(l, cfg, Some(FilterServer::with_defaults())));
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET /api/v1/pods HTTP/1.1\r\nHost: evil.com\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+        assert!(out.contains("Forbidden"));
+    }
+}

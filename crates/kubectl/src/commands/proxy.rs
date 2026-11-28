@@ -25,7 +25,98 @@ pub struct ProxyConfig {
     pub skip_tls_verify: bool,
 }
 
+/// `DefaultHostAcceptRE` (kubectl/pkg/proxy/proxy_server.go:39).
+pub const DEFAULT_HOST_ACCEPT_RE: &str = "^localhost$,^127\\.0\\.0\\.1$,^\\[::1\\]$";
+/// `DefaultPathAcceptRE` (proxy_server.go:41).
+pub const DEFAULT_PATH_ACCEPT_RE: &str = "^.*";
+/// `DefaultPathRejectRE` (proxy_server.go:43).
+pub const DEFAULT_PATH_REJECT_RE: &str = "^/api/.*/pods/.*/exec,^/api/.*/pods/.*/attach";
+/// `DefaultMethodRejectRE` (proxy_server.go:45).
+pub const DEFAULT_METHOD_REJECT_RE: &str = "^$";
+
+/// `MakeRegexpArray` (proxy_server.go:63): comma separated regexps; empty
+/// string is no regexps.
+pub fn make_regexp_array(s: &str) -> Result<Vec<regex::Regex>, regex::Error> {
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    s.split(',').map(regex::Regex::new).collect()
+}
+
+/// `matchesRegexp` (proxy_server.go:88).
+pub fn matches_regexp(s: &str, regexps: &[regex::Regex]) -> bool {
+    regexps.iter().any(|re| re.is_match(s))
+}
+
+/// `extractHost` (proxy_server.go:120): the host part of a `Host` header.
+pub fn extract_host(header: &str) -> String {
+    // net.SplitHostPort; on error the header is the host.
+    if let Some(rest) = header.strip_prefix('[') {
+        if let Some((h, port)) = rest.split_once("]:") {
+            if !port.contains(':') {
+                return h.to_string();
+            }
+        }
+        return header.to_string();
+    }
+    match header.rsplit_once(':') {
+        Some((h, _)) if !h.contains(':') => h.to_string(),
+        _ => header.to_string(),
+    }
+}
+
+/// `FilterServer` (proxy_server.go:50-110): accept/reject requests by path,
+/// method and host before they are proxied.
+#[derive(Debug, Clone)]
+pub struct FilterServer {
+    pub accept_paths: Vec<regex::Regex>,
+    pub reject_paths: Vec<regex::Regex>,
+    pub accept_hosts: Vec<regex::Regex>,
+    pub reject_methods: Vec<regex::Regex>,
+}
+
+impl FilterServer {
+    /// `NewFilter` fields from the `--accept-paths`, `--reject-paths`,
+    /// `--accept-hosts` and `--reject-methods` strings.
+    pub fn new(
+        accept_paths: &str,
+        reject_paths: &str,
+        accept_hosts: &str,
+        reject_methods: &str,
+    ) -> Result<Self, regex::Error> {
+        Ok(Self {
+            accept_paths: make_regexp_array(accept_paths)?,
+            reject_paths: make_regexp_array(reject_paths)?,
+            accept_hosts: make_regexp_array(accept_hosts)?,
+            reject_methods: make_regexp_array(reject_methods)?,
+        })
+    }
+
+    /// The filter built from the flag defaults.
+    pub fn with_defaults() -> Self {
+        Self::new(
+            DEFAULT_PATH_ACCEPT_RE,
+            DEFAULT_PATH_REJECT_RE,
+            DEFAULT_HOST_ACCEPT_RE,
+            DEFAULT_METHOD_REJECT_RE,
+        )
+        .expect("default filter regexps compile")
+    }
+
+    /// `FilterServer.accept` (proxy_server.go:98).
+    pub fn accept(&self, method: &str, path: &str, host: &str) -> bool {
+        if matches_regexp(path, &self.reject_paths) {
+            return false;
+        }
+        if matches_regexp(method, &self.reject_methods) {
+            return false;
+        }
+        matches_regexp(path, &self.accept_paths) && matches_regexp(host, &self.accept_hosts)
+    }
+}
+
 struct ProxyState {
+    filter: Option<FilterServer>,
     api_server: String,
     token: Option<String>,
     client: reqwest::Client,
@@ -33,11 +124,16 @@ struct ProxyState {
 
 /// Execute the proxy command: bind, print the address, and serve forever.
 pub async fn execute(config: ProxyConfig) -> Result<()> {
+    execute_with_filter(config, Some(FilterServer::with_defaults())).await
+}
+
+/// [`execute`] with an explicit filter; `None` is `--disable-filter`.
+pub async fn execute_with_filter(config: ProxyConfig, filter: Option<FilterServer>) -> Result<()> {
     let listener = bind_listener(&config).await?;
     let addr = listener.local_addr()?;
     println!("Starting to serve on {}", addr);
 
-    serve(listener, config).await
+    serve(listener, config, filter).await
 }
 
 /// Bind a TCP listener according to the config. Exposed for testing.
@@ -51,7 +147,11 @@ pub async fn bind_listener(config: &ProxyConfig) -> Result<TcpListener> {
 }
 
 /// Accept connections on the listener and proxy them to the API server.
-async fn serve(listener: TcpListener, config: ProxyConfig) -> Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    config: ProxyConfig,
+    filter: Option<FilterServer>,
+) -> Result<()> {
     let client = if config.skip_tls_verify {
         reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
@@ -62,6 +162,7 @@ async fn serve(listener: TcpListener, config: ProxyConfig) -> Result<()> {
     };
 
     let state = Arc::new(ProxyState {
+        filter,
         api_server: config.api_server.trim_end_matches('/').to_string(),
         token: config.token,
         client,
@@ -91,6 +192,24 @@ async fn handle_request(
 ) -> Result<Response<Full<bytes::Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let uri = req.uri().clone();
+    // `FilterServer.ServeHTTP` (proxy_server.go:128): 403 unless accepted.
+    if let Some(filter) = &state.filter {
+        let host_header = req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| uri.authority().map(|a| a.to_string()))
+            .unwrap_or_default();
+        let host = extract_host(&host_header);
+        if !filter.accept(method.as_str(), uri.path(), &host) {
+            return Ok(Response::builder()
+                .status(403)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .body(Full::new(bytes::Bytes::from("Forbidden\n")))
+                .unwrap());
+        }
+    }
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
     let target_url = format!("{}{}", state.api_server, path_and_query);

@@ -34,6 +34,7 @@ clap.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml.workspace = true
+inotify = "0.11"
 chrono.workspace = true
 prometheus.workspace = true
 # Existing locked dependencies, for upstream promhttp negotiation/exposition.

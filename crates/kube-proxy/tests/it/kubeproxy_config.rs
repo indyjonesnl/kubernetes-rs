@@ -294,3 +294,25 @@ fn kubeproxy_config_hostname_override_flag() {
     assert_eq!(c.hostname_override, "bar");
     assert!(process_hostname_override(&mut mk(), "   ").is_err());
 }
+
+#[tokio::test]
+async fn kubeproxy_config_file_change_watcher() {
+    let dir = std::env::temp_dir().join(format!("kpcfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("config.yaml");
+    std::fs::write(&f, LOAD_YAML).unwrap();
+    let w = init_config_file_watcher(&f).unwrap();
+    let h = tokio::spawn(w.changed());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    std::fs::write(&f, format!("{LOAD_YAML}# changed\n")).unwrap();
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), h)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        msg,
+        "content of the proxy server's configuration file was updated"
+    );
+    assert!(init_config_file_watcher(&dir.join("missing")).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}

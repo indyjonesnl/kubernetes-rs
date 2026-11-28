@@ -186,6 +186,17 @@ async fn main() -> Result<()> {
         .map_err(|e| e.exit())
         .unwrap();
     apply_config_file(&mut args)?;
+    if let Some(path) = args.config.clone() {
+        // options.go initWatcher/runLoop: exit with an error when the file changes.
+        let watcher =
+            kubernetes_rs_kube_proxy::config::init_config_file_watcher(std::path::Path::new(&path))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tokio::spawn(async move {
+            let msg = watcher.changed().await;
+            eprintln!("kube-proxy: {msg}");
+            std::process::exit(1);
+        });
+    }
     apply_feature_gates(&args)?;
 
     // options.go:244-251: after the feature gates are applied, the flagz

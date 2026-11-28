@@ -817,3 +817,54 @@ pub fn process_hostname_override(
     }
     Ok(())
 }
+
+/// `Options.initWatcher` (options.go:~285): watch the config file. A missing
+/// file fails here, as `AddWatch` does.
+pub struct ConfigFileWatcher {
+    events: inotify::EventStream<Vec<u8>>,
+}
+
+pub fn init_config_file_watcher(path: &std::path::Path) -> Result<ConfigFileWatcher, String> {
+    use inotify::{Inotify, WatchMask};
+    let inotify = Inotify::init().map_err(|e| e.to_string())?;
+    inotify
+        .watches()
+        .add(
+            path,
+            WatchMask::MODIFY
+                | WatchMask::CLOSE_WRITE
+                | WatchMask::MOVE_SELF
+                | WatchMask::DELETE_SELF,
+        )
+        .map_err(|e| format!("unable to watch {}: {e}", path.display()))?;
+    let events = inotify
+        .into_event_stream(vec![0u8; 4096])
+        .map_err(|e| e.to_string())?;
+    Ok(ConfigFileWatcher { events })
+}
+
+impl ConfigFileWatcher {
+    /// `eventHandler`/`errorHandler`: resolves with upstream's error text on a
+    /// write or rename of the file (`runLoop` returns it and the process exits).
+    pub async fn changed(mut self) -> String {
+        use futures::StreamExt;
+        use inotify::EventMask;
+        while let Some(ev) = self.events.next().await {
+            match ev {
+                Ok(ev)
+                    if ev.mask.intersects(
+                        EventMask::MODIFY
+                            | EventMask::CLOSE_WRITE
+                            | EventMask::MOVE_SELF
+                            | EventMask::DELETE_SELF,
+                    ) =>
+                {
+                    break
+                }
+                Ok(_) => {}
+                Err(e) => return e.to_string(),
+            }
+        }
+        "content of the proxy server's configuration file was updated".to_string()
+    }
+}

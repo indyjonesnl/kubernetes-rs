@@ -26,20 +26,32 @@ impl FieldSelector {
     /// - "spec.nodeName=node-1,status.phase!=Failed"
     /// - "metadata.namespace=default"
     pub fn parse(selector: &str) -> Result<Self, FieldSelectorError> {
-        if selector.is_empty() {
-            return Ok(Self {
-                requirements: Vec::new(),
+        // `parseSelector` (apimachinery/pkg/fields/selector.go): split on
+        // unescaped commas, sort the terms, skip empty ones.
+        let mut parts = split_terms(selector);
+        parts.sort();
+        let mut requirements = Vec::new();
+        for part in parts {
+            if part.is_empty() {
+                continue;
+            }
+            let Some((lhs, op, rhs)) = split_term(&part) else {
+                return Err(FieldSelectorError::InvalidSelector {
+                    selector: selector.to_string(),
+                    part,
+                });
+            };
+            let value = unescape_value(rhs)?;
+            requirements.push(FieldRequirement {
+                field: lhs.to_string(),
+                operator: if op == "!=" {
+                    FieldOperator::NotEquals
+                } else {
+                    FieldOperator::Equals
+                },
+                value,
             });
         }
-
-        let mut requirements = Vec::new();
-
-        // Split by comma
-        for requirement_str in selector.split(',') {
-            let requirement = FieldRequirement::parse(requirement_str.trim())?;
-            requirements.push(requirement);
-        }
-
         Ok(Self { requirements })
     }
 
@@ -77,44 +89,6 @@ pub struct FieldRequirement {
 }
 
 impl FieldRequirement {
-    /// Parse a single field requirement
-    fn parse(requirement: &str) -> Result<Self, FieldSelectorError> {
-        // Try to find operator
-        if let Some(pos) = requirement.find("!=") {
-            let field = requirement[..pos].trim().to_string();
-            let value = requirement[pos + 2..].trim().to_string();
-            return Ok(Self {
-                field,
-                operator: FieldOperator::NotEquals,
-                value,
-            });
-        }
-
-        if let Some(pos) = requirement.find("==") {
-            let field = requirement[..pos].trim().to_string();
-            let value = requirement[pos + 2..].trim().to_string();
-            return Ok(Self {
-                field,
-                operator: FieldOperator::Equals,
-                value,
-            });
-        }
-
-        if let Some(pos) = requirement.find('=') {
-            let field = requirement[..pos].trim().to_string();
-            let value = requirement[pos + 1..].trim().to_string();
-            return Ok(Self {
-                field,
-                operator: FieldOperator::Equals,
-                value,
-            });
-        }
-
-        Err(FieldSelectorError::InvalidRequirement(
-            requirement.to_string(),
-        ))
-    }
-
     /// Check if a resource matches this requirement
     fn matches(&self, resource: &Value) -> bool {
         let field_value = extract_field_value(resource, &self.field);
@@ -154,6 +128,83 @@ impl FieldRequirement {
     pub fn value(&self) -> &str {
         &self.value
     }
+}
+
+/// `EscapeValue` (selector.go): escape `\\`, `,` and `=` in a value.
+pub fn escape_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | ',' | '=') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `UnescapeValue` (selector.go): reverse of [`escape_value`]; unescaped `,`
+/// or `=`, an unknown escape or a trailing backslash is an error.
+pub fn unescape_value(s: &str) -> Result<String, FieldSelectorError> {
+    if !s.contains(['\\', ',', '=']) {
+        return Ok(s.to_string());
+    }
+    let mut v = String::with_capacity(s.len());
+    let mut in_slash = false;
+    for c in s.chars() {
+        if in_slash {
+            match c {
+                '\\' | ',' | '=' => v.push(c),
+                _ => return Err(FieldSelectorError::InvalidEscapeSequence(format!("\\{c}"))),
+            }
+            in_slash = false;
+            continue;
+        }
+        match c {
+            '\\' => in_slash = true,
+            ',' | '=' => return Err(FieldSelectorError::UnescapedRune((c, c as u32))),
+            _ => v.push(c),
+        }
+    }
+    if in_slash {
+        return Err(FieldSelectorError::InvalidEscapeSequence("\\".to_string()));
+    }
+    Ok(v)
+}
+
+/// `splitTerms` (selector.go): split on commas that are not backslash-escaped.
+pub fn split_terms(field_selector: &str) -> Vec<String> {
+    if field_selector.is_empty() {
+        return Vec::new();
+    }
+    let mut terms = Vec::new();
+    let mut start = 0;
+    let mut in_slash = false;
+    for (i, c) in field_selector.char_indices() {
+        if in_slash {
+            in_slash = false;
+        } else if c == '\\' {
+            in_slash = true;
+        } else if c == ',' {
+            terms.push(field_selector[start..i].to_string());
+            start = i + 1;
+        }
+    }
+    terms.push(field_selector[start..].to_string());
+    terms
+}
+
+/// `splitTerm` (selector.go): lhs, operator and rhs at the first occurrence of
+/// `!=`, `==` or `=` (checked in that order at each position).
+pub fn split_term(term: &str) -> Option<(&str, &'static str, &str)> {
+    for (i, _) in term.char_indices() {
+        let remaining = &term[i..];
+        for op in ["!=", "==", "="] {
+            if remaining.starts_with(op) {
+                return Some((&term[..i], op, &term[i + op.len()..]));
+            }
+        }
+    }
+    None
 }
 
 /// Field selector operators
@@ -246,6 +297,19 @@ pub enum FieldSelectorError {
     #[error("Invalid field selector requirement: {0}")]
     InvalidRequirement(String),
 
+    /// `fmt.Errorf("invalid selector: '%s'; can't understand '%s'", ...)`.
+    #[error("invalid selector: '{selector}'; can't understand '{part}'")]
+    InvalidSelector { selector: String, part: String },
+
+    /// `InvalidEscapeSequence.Error`.
+    #[error("invalid field selector: invalid escape sequence: {0}")]
+    InvalidEscapeSequence(String),
+
+    /// `UnescapedRune.Error`.
+    /// Go prints the rune with `%v`, i.e. its code point.
+    #[error("invalid field selector: unescaped character in value: {}", .0.1)]
+    UnescapedRune((char, u32)),
+
     #[error("Invalid operator in field selector: {0}")]
     InvalidOperator(String),
 
@@ -305,7 +369,7 @@ impl fmt::Display for FieldSelector {
         let parts: Vec<String> = self
             .requirements
             .iter()
-            .map(|req| format!("{}{}{}", req.field, req.operator, req.value))
+            .map(|req| format!("{}{}{}", req.field, req.operator, escape_value(&req.value)))
             .collect();
         write!(f, "{}", parts.join(","))
     }

@@ -24,8 +24,9 @@ mod tests {
     fn test_parse_multiple_requirements() {
         let selector = FieldSelector::parse("status.phase=Running,spec.nodeName=node-1").unwrap();
         assert_eq!(selector.requirements.len(), 2);
-        assert_eq!(selector.requirements[0].field, "status.phase");
-        assert_eq!(selector.requirements[1].field, "spec.nodeName");
+        // parseSelector sorts the terms (selector.go), so spec.nodeName first.
+        assert_eq!(selector.requirements[0].field, "spec.nodeName");
+        assert_eq!(selector.requirements[1].field, "status.phase");
     }
 
     #[test]

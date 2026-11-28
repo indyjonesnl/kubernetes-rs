@@ -117,5 +117,6 @@ mod wire_field_shape_guard;
 
 mod networking_store_ingress_validation;
 
+mod field_selector_escape;
 mod networking_store_policy_class_validation;
 mod wait_backoff;
